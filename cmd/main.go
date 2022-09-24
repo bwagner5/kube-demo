@@ -19,14 +19,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-var canvasStyle = lipgloss.NewStyle().Padding(1, 2, 1, 2).MaxWidth(100)
+var canvasStyle = lipgloss.NewStyle().Padding(1, 2, 1, 2)
 
 type k8sStateChange struct{}
 
 type Model struct {
 	Nodes           []*corev1.Node
 	informerFactory informers.SharedInformerFactory
-	nodesInformer   cache.SharedIndexInformer
+	nodeInformer    cache.SharedIndexInformer
+	podInformer     cache.SharedIndexInformer
 	stopCh          chan struct{}
 	k8sStateUpdate  chan struct{}
 }
@@ -43,14 +44,21 @@ func New() *Model {
 	informerFactory := informers.NewSharedInformerFactory(kubeclient, time.Minute*10)
 	stopCh := make(chan struct{})
 	k8sStateUpdate := make(chan struct{})
-	nodesInformer := informerFactory.Core().V1().Nodes().Informer()
+	nodeInformer := informerFactory.Core().V1().Nodes().Informer()
+	podInformer := informerFactory.Core().V1().Pods().Informer()
 	model := &Model{
 		informerFactory: informerFactory,
-		nodesInformer:   nodesInformer,
+		nodeInformer:    nodeInformer,
+		podInformer:     podInformer,
 		stopCh:          stopCh,
 		k8sStateUpdate:  k8sStateUpdate,
 	}
-	model.nodesInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	model.nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(_ interface{}) { model.k8sStateUpdate <- struct{}{} },
+		UpdateFunc: func(_, _ interface{}) { model.k8sStateUpdate <- struct{}{} },
+		DeleteFunc: func(_ interface{}) { model.k8sStateUpdate <- struct{}{} },
+	})
+	model.podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(_ interface{}) { model.k8sStateUpdate <- struct{}{} },
 		UpdateFunc: func(_, _ interface{}) { model.k8sStateUpdate <- struct{}{} },
 		DeleteFunc: func(_ interface{}) { model.k8sStateUpdate <- struct{}{} },
@@ -60,10 +68,10 @@ func New() *Model {
 }
 
 func (m *Model) Init() tea.Cmd {
-	return func() tea.Msg {
+	return tea.Batch(func() tea.Msg {
 		m.informerFactory.WaitForCacheSync(m.stopCh)
 		return k8sStateChange{}
-	}
+	}, tea.EnterAltScreen)
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -96,32 +104,84 @@ func (m *Model) View() string {
 }
 
 func (m *Model) nodes() string {
-	nodeHeight := 10
-	nodeWidth := 20
-	padding := 1
 	var boxRows [][]string
-	row := -1
-	if len(boxRows) == 0 || (len(boxRows[row])+1)*(nodeWidth+padding*2) >= canvasStyle.GetMaxWidth() {
-		boxRows = append(boxRows, []string{})
-		row++
-	}
-	nodes := m.nodesInformer.GetStore().List()
+	nodes := m.nodeInformer.GetStore().List()
 	sort.Slice(nodes, func(i, j int) bool {
 		return nodes[i].(*corev1.Node).CreationTimestamp.Unix() < nodes[j].(*corev1.Node).CreationTimestamp.Unix()
 	})
-	for _, obj := range nodes {
+	nodeStyle := lipgloss.NewStyle().
+		Align(lipgloss.Left).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color("#000000")).
+		Border(lipgloss.HiddenBorder(), true).
+		BorderBackground(lipgloss.Color("#93aabc")).
+		Margin(1).
+		Padding(1).
+		Height(20).
+		Width(30)
+	row := -1
+	boxSize := nodeStyle.GetWidth() + nodeStyle.GetHorizontalMargins() + nodeStyle.GetHorizontalBorderSize()
+	perRow := int(float64(canvasStyle.GetMaxWidth()) / float64(boxSize+canvasStyle.GetHorizontalPadding()))
+	for i, obj := range nodes {
 		node := obj.(*corev1.Node)
-		boxRows[row] = append(boxRows[row], lipgloss.NewStyle().
-			Align(lipgloss.Left).
-			Foreground(lipgloss.Color("#000000")).
-			Background(lipgloss.Color("#93aabc")).
-			Margin(1).
-			Padding(1).
-			Height(nodeHeight).
-			Width(nodeWidth).Render(node.Name))
+		box := nodeStyle.Render(
+			lipgloss.JoinVertical(lipgloss.Left,
+				node.Name,
+				m.pods(node, nodeStyle),
+			),
+		)
+		if i%int(perRow) == 0 {
+			row++
+			boxRows = append(boxRows, []string{})
+		}
+		boxRows[row] = append(boxRows[row], box)
 	}
 	rows := lo.Map(boxRows, func(row []string, _ int) string {
 		return lipgloss.JoinHorizontal(lipgloss.Top, row...)
+	})
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+func (m *Model) pods(node *corev1.Node, nodeStyle lipgloss.Style) string {
+	defaultColor := lipgloss.Color("#EE1111")
+	dsColor := lipgloss.Color("#1111EE")
+	color := defaultColor
+	var boxRows [][]string
+	pods := lo.Filter(m.podInformer.GetStore().List(), func(obj interface{}, _ int) bool {
+		pod := obj.(*corev1.Pod)
+		return pod.Spec.NodeName == node.Name
+	})
+	podStyle := lipgloss.NewStyle().
+		Align(lipgloss.Bottom).
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color("#000000")).
+		Border(lipgloss.NormalBorder(), true).
+		BorderForeground(defaultColor).
+		Margin(0).
+		Padding(0).
+		Height(1).
+		Width(1)
+	boxSize := podStyle.GetWidth() + podStyle.GetHorizontalMargins()
+	perRow := int(float64(nodeStyle.GetWidth()) / float64(boxSize+nodeStyle.GetHorizontalPadding()))
+	sort.Slice(pods, func(i, j int) bool {
+		return pods[i].(*corev1.Pod).CreationTimestamp.Unix() < pods[j].(*corev1.Pod).CreationTimestamp.Unix()
+	})
+	row := -1
+	for i, obj := range pods {
+		if i%perRow == 0 {
+			boxRows = append(boxRows, []string{})
+			row++
+		}
+		pod := obj.(*corev1.Pod)
+		for _, o := range pod.OwnerReferences {
+			if o.Kind == "DaemonSet" {
+				color = dsColor
+			}
+		}
+		boxRows[row] = append(boxRows[row], podStyle.Copy().BorderForeground(color).Render(""))
+	}
+	rows := lo.Map(boxRows, func(row []string, _ int) string {
+		return lipgloss.JoinHorizontal(lipgloss.Bottom, row...)
 	})
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
