@@ -21,10 +21,43 @@ import (
 
 var canvasStyle = lipgloss.NewStyle().Padding(1, 2, 1, 2)
 
+var white = lipgloss.Color("#FFFFFF")
+var black = lipgloss.Color("#000000")
+var lightBlue = lipgloss.Color("#93aabc")
+var blue = lipgloss.Color("#0000FF")
+var green = lipgloss.Color("#00FF00")
+var red = lipgloss.Color("#FF0000")
+var yellow = lipgloss.Color("#FFFF00")
+
+var nodeStyle = lipgloss.NewStyle().
+	Align(lipgloss.Left).
+	Foreground(white).
+	Background(black).
+	Border(lipgloss.HiddenBorder(), true).
+	BorderBackground(lightBlue).
+	Margin(1).
+	Padding(1).
+	Height(10).
+	Width(40)
+
+var podStyle = lipgloss.NewStyle().
+	Align(lipgloss.Bottom).
+	Foreground(white).
+	Background(black).
+	Border(lipgloss.NormalBorder(), true).
+	BorderForeground(green).
+	Margin(0).
+	Padding(0).
+	Height(1).
+	Width(1)
+
 type k8sStateChange struct{}
 
 type Model struct {
 	Nodes           []*corev1.Node
+	selectedNode    int
+	selectedPod     int
+	podSelection    bool
 	informerFactory informers.SharedInformerFactory
 	nodeInformer    cache.SharedIndexInformer
 	podInformer     cache.SharedIndexInformer
@@ -81,6 +114,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			close(m.stopCh)
 			return m, tea.Quit
+		case "left", "right", "up", "down":
+			m.selectedNode = m.moveCursor(msg)
 		}
 	case k8sStateChange:
 		return m, func() tea.Msg {
@@ -95,36 +130,86 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) moveCursor(key tea.KeyMsg) int {
+	totalObjects := len(m.nodeInformer.GetStore().ListKeys())
+	perRow := m.GetBoxesPerRow(canvasStyle, nodeStyle)
+	switch key.String() {
+	case "right":
+		rowNum := m.selectedNode / perRow
+		index := m.selectedNode + 1
+		if index >= totalObjects {
+			return index - index%perRow
+		}
+		return rowNum*perRow + index%perRow
+	case "left":
+		rowNum := m.selectedNode / perRow
+		index := rowNum*perRow + mod((m.selectedNode-1), perRow)
+		if index >= totalObjects {
+			return totalObjects - 1
+		}
+		return index
+	case "up":
+		index := m.selectedNode - perRow
+		col := mod(index, perRow)
+		bottomRow := totalObjects / perRow
+		if index < 0 {
+			newPos := bottomRow*perRow + col
+			if newPos >= totalObjects {
+				return newPos - perRow
+			}
+			return bottomRow*perRow + col
+		}
+		return index
+	case "down":
+		index := m.selectedNode + perRow
+		if index >= totalObjects {
+			return index % perRow
+		}
+		return index
+	}
+	return 0
+}
+
+func mod(a, b int) int {
+	return (a%b + b) % b
+}
+
 func (m *Model) View() string {
 	physicalWidth, _, _ := term.GetSize(int(os.Stdout.Fd()))
-	canvasStyle = canvasStyle.MaxWidth(physicalWidth)
+	canvasStyle = canvasStyle.MaxWidth(physicalWidth).Width(physicalWidth)
 	var canvas strings.Builder
 	canvas.WriteString(m.nodes())
 	return canvasStyle.Render(canvas.String())
 }
 
+func (m *Model) GetBoxesPerRow(container lipgloss.Style, subContainer lipgloss.Style) int {
+	boxSize := subContainer.GetWidth() + subContainer.GetHorizontalMargins() + subContainer.GetHorizontalBorderSize()
+	return int(float64(container.GetWidth()-container.GetHorizontalPadding()) / float64(boxSize))
+}
+
 func (m *Model) nodes() string {
 	var boxRows [][]string
 	nodes := m.nodeInformer.GetStore().List()
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].(*corev1.Node).CreationTimestamp.Unix() < nodes[j].(*corev1.Node).CreationTimestamp.Unix()
+	sort.SliceStable(nodes, func(i, j int) bool {
+		iCreated := nodes[i].(*corev1.Node).CreationTimestamp.Unix()
+		jCreated := nodes[j].(*corev1.Node).CreationTimestamp.Unix()
+		if iCreated == jCreated {
+			return string(nodes[i].(*corev1.Node).UID) < string(nodes[j].(*corev1.Node).UID)
+		}
+		return iCreated < jCreated
 	})
-	nodeStyle := lipgloss.NewStyle().
-		Align(lipgloss.Left).
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(lipgloss.Color("#000000")).
-		Border(lipgloss.HiddenBorder(), true).
-		BorderBackground(lipgloss.Color("#93aabc")).
-		Margin(1).
-		Padding(1).
-		Height(20).
-		Width(30)
+	// for i := 0; i < 10; i++ {
+	// 	nodes = append(nodes, &corev1.Node{})
+	// }
 	row := -1
-	boxSize := nodeStyle.GetWidth() + nodeStyle.GetHorizontalMargins() + nodeStyle.GetHorizontalBorderSize()
-	perRow := int(float64(canvasStyle.GetMaxWidth()) / float64(boxSize+canvasStyle.GetHorizontalPadding()))
+	perRow := m.GetBoxesPerRow(canvasStyle, nodeStyle)
 	for i, obj := range nodes {
+		color := lightBlue
 		node := obj.(*corev1.Node)
-		box := nodeStyle.Render(
+		if i == m.selectedNode {
+			color = red
+		}
+		box := nodeStyle.BorderBackground(color).Render(
 			lipgloss.JoinVertical(lipgloss.Left,
 				node.Name,
 				m.pods(node, nodeStyle),
@@ -143,31 +228,23 @@ func (m *Model) nodes() string {
 }
 
 func (m *Model) pods(node *corev1.Node, nodeStyle lipgloss.Style) string {
-	defaultColor := lipgloss.Color("#EE1111")
-	dsColor := lipgloss.Color("#1111EE")
-	color := defaultColor
 	var boxRows [][]string
 	pods := lo.Filter(m.podInformer.GetStore().List(), func(obj interface{}, _ int) bool {
 		pod := obj.(*corev1.Pod)
 		return pod.Spec.NodeName == node.Name
 	})
-	podStyle := lipgloss.NewStyle().
-		Align(lipgloss.Bottom).
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(lipgloss.Color("#000000")).
-		Border(lipgloss.NormalBorder(), true).
-		BorderForeground(defaultColor).
-		Margin(0).
-		Padding(0).
-		Height(1).
-		Width(1)
-	boxSize := podStyle.GetWidth() + podStyle.GetHorizontalMargins()
-	perRow := int(float64(nodeStyle.GetWidth()) / float64(boxSize+nodeStyle.GetHorizontalPadding()))
-	sort.Slice(pods, func(i, j int) bool {
-		return pods[i].(*corev1.Pod).CreationTimestamp.Unix() < pods[j].(*corev1.Pod).CreationTimestamp.Unix()
+	perRow := m.GetBoxesPerRow(nodeStyle, podStyle)
+	sort.SliceStable(pods, func(i, j int) bool {
+		iCreated := pods[i].(*corev1.Pod).CreationTimestamp.Unix()
+		jCreated := pods[j].(*corev1.Pod).CreationTimestamp.Unix()
+		if iCreated == jCreated {
+			return string(pods[i].(*corev1.Pod).UID) < string(pods[j].(*corev1.Pod).UID)
+		}
+		return iCreated < jCreated
 	})
 	row := -1
 	for i, obj := range pods {
+		color := green
 		if i%perRow == 0 {
 			boxRows = append(boxRows, []string{})
 			row++
@@ -175,7 +252,7 @@ func (m *Model) pods(node *corev1.Node, nodeStyle lipgloss.Style) string {
 		pod := obj.(*corev1.Pod)
 		for _, o := range pod.OwnerReferences {
 			if o.Kind == "DaemonSet" {
-				color = dsColor
+				color = blue
 			}
 		}
 		boxRows[row] = append(boxRows[row], podStyle.Copy().BorderForeground(color).Render(""))
